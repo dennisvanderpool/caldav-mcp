@@ -3,101 +3,141 @@ import type { CalDAVClient } from "ts-caldav";
 import { z } from "zod";
 import { hrefFor, toCalendarPath } from "./caldav-href.js";
 import {
-	type RecurrenceRuleInput,
-	recurrenceRuleSchema,
-	toRecurrenceRule,
+    type RecurrenceRuleInput,
+    recurrenceRuleSchema,
+    toRecurrenceRule,
 } from "./recurrence-rule.js";
 import { carryOverWholeDayDates, toWholeDayDate } from "./whole-day-date.js";
 
 interface UpdateEventInput {
-	calendarUrl: string;
-	description?: string | undefined;
-	end?: string | undefined;
-	location?: string | undefined;
-	recurrenceRule?: RecurrenceRuleInput | undefined;
-	start?: string | undefined;
-	summary?: string | undefined;
-	uid: string;
-	wholeDay?: boolean | undefined;
+    calendarUrl: string;
+    description?: string | undefined;
+    end?: string | undefined;
+    location?: string | undefined;
+    organizer?: string | undefined;
+    recurrenceRule?: RecurrenceRuleInput | undefined;
+    start?: string | undefined;
+    attendees?: string[] | undefined;
+    summary?: string | undefined;
+    uid: string;
+    wholeDay?: boolean | undefined;
 }
 
 export const updateEventDefinition = {
-	description:
-		"Updates an existing event in the calendar specified by its URL. Only provided fields are changed. For a one-day full-day event, set `wholeDay` to true and set `start` and `end` to the same calendar day.",
-	inputSchema: {
-		calendarUrl: z.string(),
-		description: z.string().optional(),
-		end: z.string().datetime({ offset: true }).optional(),
-		location: z.string().optional(),
-		recurrenceRule: recurrenceRuleSchema.optional(),
-		start: z.string().datetime({ offset: true }).optional(),
-		summary: z.string().optional(),
-		uid: z
-			.string()
-			.describe(
-				"Unique identifier of the event to update (obtained from list-events)"
-			),
-		wholeDay: z
-			.boolean()
-			.optional()
-			.describe("Update whether this is a whole-day event"),
-	},
-	name: "update-event",
-	returns: "The unique ID of the updated event",
+    description:
+        "Updates an existing event in the calendar specified by its URL. Only provided fields are changed. For a one-day full-day event, set `wholeDay` to true and set `start` and `end` to the same calendar day.",
+    inputSchema: {
+        calendarUrl: z.string(),
+        description: z.string().optional(),
+        end: z.string().datetime({ offset: true }).optional(),
+        location: z.string().optional(),
+        organizer: z
+            .string()
+            .optional()
+            .describe(
+                "Organizer email (no mailto:); pass to set or change ORGANIZER. Omit to leave it as stored."
+            ),
+        recurrenceRule: recurrenceRuleSchema.optional(),
+        start: z.string().datetime({ offset: true }).optional(),
+        attendees: z
+            .array(z.string())
+            .optional()
+            .describe(
+                "Full desired attendee list (no mailto:); pass to set/replace ATTENDEE lines. Omit to leave stored attendees untouched."
+            ),
+        summary: z.string().optional(),
+        uid: z
+            .string()
+            .describe(
+                "Unique identifier of the event to update (obtained from list-events)"
+            ),
+        wholeDay: z
+            .boolean()
+            .optional()
+            .describe("Update whether this is a whole-day event"),
+    },
+    name: "update-event",
+    returns: "The unique ID of the updated event",
 } as const;
 
 export function registerUpdateEvent(client: CalDAVClient, server: McpServer) {
-	server.registerTool(
-		updateEventDefinition.name,
-		{
-			description: updateEventDefinition.description,
-			inputSchema: updateEventDefinition.inputSchema,
-		},
-		async (args: UpdateEventInput) => {
-			const {
-				uid,
-				summary,
-				start,
-				end,
-				wholeDay,
-				description,
-				location,
-				recurrenceRule,
-			} = args;
-			const calendarUrl = toCalendarPath(args.calendarUrl, client.baseUrl);
+    server.registerTool(
+        updateEventDefinition.name,
+        {
+            description: updateEventDefinition.description,
+            inputSchema: updateEventDefinition.inputSchema,
+        },
+        async (args: UpdateEventInput) => {
+            const {
+                uid,
+                summary,
+                start,
+                end,
+                wholeDay,
+                description,
+                location,
+                recurrenceRule,
+                organizer,
+                attendees,
+            } = args;
+            const calendarUrl = toCalendarPath(args.calendarUrl, client.baseUrl);
 
-			const href = hrefFor(calendarUrl, uid);
+            const href = hrefFor(calendarUrl, uid);
 
-			const [existing] = await client.getEventsByHref(calendarUrl, [href]);
-			if (!existing) {
-				throw new Error(`Event not found: ${uid}`);
-			}
+            const [existing] = await client.getEventsByHref(calendarUrl, [href]);
+            if (!existing) {
+                throw new Error(`Event not found: ${uid}`);
+            }
 
-			const effectiveWholeDay = wholeDay ?? existing.wholeDay;
+            const effectiveWholeDay = wholeDay ?? existing.wholeDay;
 
-			const updated = await client.updateEvent(calendarUrl, {
-				...existing,
-				// Dates the caller doesn't pass are carried over; reshape them so the
-				// writer stores the same days. Explicit values below override these.
-				...(effectiveWholeDay && carryOverWholeDayDates(existing)),
-				...(summary !== undefined && { summary }),
-				...(start !== undefined && {
-					start: effectiveWholeDay ? toWholeDayDate(start) : new Date(start),
-				}),
-				...(end !== undefined && {
-					end: effectiveWholeDay ? toWholeDayDate(end) : new Date(end),
-				}),
-				...(wholeDay !== undefined && { wholeDay }),
-				...(description !== undefined && { description }),
-				...(location !== undefined && { location }),
-				...(recurrenceRule !== undefined && {
-					recurrenceRule: toRecurrenceRule(recurrenceRule, effectiveWholeDay),
-				}),
-			});
+            // Merge organizer/attendees into the event's stored customFields
+            // (ts-caldav round-trips unknown props there); never wipe other fields.
+            const existingCustom = (existing as unknown as {
+                customFields?: Record<string, string | string[]>;
+            }).customFields ?? {};
+            const nextCustom: Record<string, string | string[]> = {
+                ...existingCustom,
+            };
+            if (organizer !== undefined) {
+                if (organizer) nextCustom.organizer = `mailto:${organizer}`;
+                else delete nextCustom.organizer;
+            }
+            if (attendees !== undefined) {
+                if (attendees.length)
+                    nextCustom.attendee = attendees.map((a) => `mailto:${a}`);
+                else delete nextCustom.attendee;
+            }
 
-			return {
-				content: [{ text: updated.uid, type: "text" }],
-			};
-		}
-	);
+            const updated = await client.updateEvent(calendarUrl, {
+                ...existing,
+                // Dates the caller doesn't pass are carried over; reshape them so the
+                // writer stores the same days. Explicit values below override these.
+                ...(effectiveWholeDay && carryOverWholeDayDates(existing)),
+                ...(summary !== undefined && { summary }),
+                ...(start !== undefined && {
+                    start: effectiveWholeDay ? toWholeDayDate(start) : new Date(start),
+                }),
+                ...(end !== undefined && {
+                    end: effectiveWholeDay ? toWholeDayDate(end) : new Date(end),
+                }),
+                ...(wholeDay !== undefined && { wholeDay }),
+                ...(description !== undefined && { description }),
+                ...(location !== undefined && { location }),
+                ...(recurrenceRule !== undefined && {
+                    recurrenceRule: toRecurrenceRule(recurrenceRule, effectiveWholeDay),
+                }),
+                ...(organizer !== undefined || attendees !== undefined
+                    ? {
+                            customFields:
+                                nextCustom as unknown as never,
+                        }
+                    : {}),
+            });
+
+            return {
+                content: [{ text: updated.uid, type: "text" }],
+            };
+        }
+    );
 }
